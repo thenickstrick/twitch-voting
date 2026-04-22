@@ -31,9 +31,9 @@ const (
 )
 
 type bridge struct {
-	cfg         *Config
-	votes       *VoteState
-	logger      *logrus.Logger
+	cfg          *Config
+	votes        *VoteState
+	logger       *logrus.Logger
 	votesLimiter *rate.Limiter
 }
 

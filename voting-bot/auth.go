@@ -16,8 +16,8 @@ import (
 )
 
 const (
-	tokenValidateURL = "https://id.twitch.tv/oauth2/validate"
-	tokenRefreshURL  = "https://id.twitch.tv/oauth2/token"
+	defaultTokenValidateURL = "https://id.twitch.tv/oauth2/validate"
+	defaultTokenRefreshURL  = "https://id.twitch.tv/oauth2/token"
 
 	// Refresh proactively once 80% of the access-token lifetime has passed; this
 	// leaves a 20% buffer for transient failures without burning through
@@ -25,10 +25,17 @@ const (
 	refreshLeadFraction = 0.8
 	refreshMinLead      = 1 * time.Minute
 	refreshRetryBackoff = 30 * time.Second
+	// Cap for exponential backoff on repeated refresh failures. A permanently
+	// revoked refresh token would otherwise spam the logs every 30s forever.
+	refreshMaxBackoff = 5 * time.Minute
 
 	// Cap for error-body reads so a misbehaving upstream can't make us log
 	// megabytes of noise into journald.
 	authErrorBodyLimit = 2 * 1024
+
+	// singleflight key for the refresh path. All concurrent refresh callers
+	// collapse onto one in-flight HTTP request regardless of call site.
+	refreshSingleflightKey = "refresh"
 )
 
 var errTokenUnauthorized = errors.New("access token unauthorized")
@@ -116,7 +123,7 @@ func (c *TwitchClient) validate(ctx context.Context) error {
 }
 
 func (c *TwitchClient) validateOnce(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tokenValidateURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.tokenValidateURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to build auth validate request: %w", err)
 	}
@@ -154,9 +161,20 @@ type refreshResponse struct {
 	TokenType    string   `json:"token_type"`
 }
 
-// refreshToken exchanges the stored refresh token for a new access token via
-// Twitch's token endpoint, updating the store on success.
+// refreshToken is the serialized, deduplicated entry point for refreshing the
+// access token. refreshLoop and doAuth's 401 retry both call it; singleflight
+// ensures only one HTTP exchange reaches Twitch even under concurrent callers.
+// Without this, two parallel refreshes would race: Twitch rotates the refresh
+// token on each use, so the second request would POST a now-invalid token and
+// fail with invalid_grant — masking the real state of the store.
 func (c *TwitchClient) refreshToken(ctx context.Context) error {
+	_, err, _ := c.refreshGroup.Do(refreshSingleflightKey, func() (any, error) {
+		return nil, c.doRefresh(ctx)
+	})
+	return err
+}
+
+func (c *TwitchClient) doRefresh(ctx context.Context) error {
 	current := c.tokens.refresh()
 
 	form := url.Values{}
@@ -165,7 +183,7 @@ func (c *TwitchClient) refreshToken(ctx context.Context) error {
 	form.Set("client_id", c.cfg.ClientID)
 	form.Set("client_secret", c.cfg.ClientSecret)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenRefreshURL,
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenRefreshURL,
 		strings.NewReader(form.Encode()))
 	if err != nil {
 		return fmt.Errorf("failed to build refresh request: %w", err)
@@ -204,10 +222,18 @@ func (c *TwitchClient) refreshToken(ctx context.Context) error {
 	return nil
 }
 
-// refreshLoop proactively refreshes the access token ahead of expiry. Exits
-// cleanly on ctx cancellation. Retries indefinitely on failure — if the refresh
-// token is permanently revoked, downstream Helix calls will surface that.
+// refreshLoop proactively refreshes the access token ahead of expiry.
+//
+// Ordering invariant: main must call validate() synchronously before spawning
+// this goroutine. validate() is what populates tokenStore.expiresAt with the
+// actual remaining lifetime; without it, nextRefreshIn() sees expiresAt=0 and
+// clamps to refreshMinLead, so the loop would tick every 1 minute forever.
+//
+// On refresh failure, backoff doubles up to refreshMaxBackoff so a permanently
+// revoked refresh token doesn't flood the logs; it resets after the next
+// successful refresh.
 func (c *TwitchClient) refreshLoop(ctx context.Context) {
+	backoff := refreshRetryBackoff
 	for {
 		wait := c.nextRefreshIn()
 		select {
@@ -221,14 +247,20 @@ func (c *TwitchClient) refreshLoop(ctx context.Context) {
 				return
 			}
 			c.logger.WithError(err).
-				WithField("retry_in_sec", int(refreshRetryBackoff.Seconds())).
+				WithField("retry_in_sec", int(backoff.Seconds())).
 				Error("Failed to refresh OAuth access token.")
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(refreshRetryBackoff):
+			case <-time.After(backoff):
 			}
+			backoff *= 2
+			if backoff > refreshMaxBackoff {
+				backoff = refreshMaxBackoff
+			}
+			continue
 		}
+		backoff = refreshRetryBackoff
 	}
 }
 

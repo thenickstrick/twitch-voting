@@ -11,20 +11,20 @@ func TestValidatePlayerNames(t *testing.T) {
 		players []string
 		wantErr bool
 	}{
-		"single valid":                {[]string{"Alice"}, false},
-		"multiple valid":              {[]string{"Alice", "Bob", "Charlie"}, false},
-		"with underscores":            {[]string{"Player_1", "Player_2"}, false},
-		"digits":                      {[]string{"robloxer123"}, false},
-		"exactly at max length":       {[]string{strings.Repeat("a", maxPlayerName)}, false},
-		"over max length":             {[]string{strings.Repeat("a", maxPlayerName+1)}, true},
-		"empty string":                {[]string{""}, true},
-		"contains space":              {[]string{"Al ice"}, true},
-		"contains dash":               {[]string{"Al-ice"}, true},
-		"contains special":            {[]string{"Al!ice"}, true},
-		"exact duplicate":             {[]string{"Alice", "Alice"}, true},
-		"case-insensitive duplicate":  {[]string{"Alice", "ALICE"}, true},
-		"one valid one invalid":       {[]string{"Alice", "Bob!"}, true},
-		"unicode letter":              {[]string{"Álice"}, true}, // regex \w in Go is ASCII only
+		"single valid":               {[]string{"Alice"}, false},
+		"multiple valid":             {[]string{"Alice", "Bob", "Charlie"}, false},
+		"with underscores":           {[]string{"Player_1", "Player_2"}, false},
+		"digits":                     {[]string{"robloxer123"}, false},
+		"exactly at max length":      {[]string{strings.Repeat("a", maxPlayerName)}, false},
+		"over max length":            {[]string{strings.Repeat("a", maxPlayerName+1)}, true},
+		"empty string":               {[]string{""}, true},
+		"contains space":             {[]string{"Al ice"}, true},
+		"contains dash":              {[]string{"Al-ice"}, true},
+		"contains special":           {[]string{"Al!ice"}, true},
+		"exact duplicate":            {[]string{"Alice", "Alice"}, true},
+		"case-insensitive duplicate": {[]string{"Alice", "ALICE"}, true},
+		"one valid one invalid":      {[]string{"Alice", "Bob!"}, true},
+		"unicode letter":             {[]string{"Álice"}, true}, // regex \w in Go is ASCII only
 	}
 
 	for name, test := range tests {
@@ -45,16 +45,16 @@ func TestIsValidReconnectURL(t *testing.T) {
 		url  string
 		want bool
 	}{
-		"canonical eventsub":     {"wss://eventsub.wss.twitch.tv/ws?session=abc", true},
-		"canonical root":         {"wss://eventsub.wss.twitch.tv/", true},
-		"ws instead of wss":      {"ws://eventsub.wss.twitch.tv/ws", false},
-		"https scheme":           {"https://eventsub.wss.twitch.tv/ws", false},
-		"wrong host":             {"wss://evil.com/ws", false},
-		"host suffix attack":     {"wss://eventsub.wss.twitch.tv.evil.com/ws", false},
-		"host prefix attack":     {"wss://evil.eventsub.wss.twitch.tv/ws", false},
-		"empty string":           {"", false},
-		"non-url garbage":        {"not a url at all! ---", false},
-		"missing scheme":         {"eventsub.wss.twitch.tv/ws", false},
+		"canonical eventsub": {"wss://eventsub.wss.twitch.tv/ws?session=abc", true},
+		"canonical root":     {"wss://eventsub.wss.twitch.tv/", true},
+		"ws instead of wss":  {"ws://eventsub.wss.twitch.tv/ws", false},
+		"https scheme":       {"https://eventsub.wss.twitch.tv/ws", false},
+		"wrong host":         {"wss://evil.com/ws", false},
+		"host suffix attack": {"wss://eventsub.wss.twitch.tv.evil.com/ws", false},
+		"host prefix attack": {"wss://evil.eventsub.wss.twitch.tv/ws", false},
+		"empty string":       {"", false},
+		"non-url garbage":    {"not a url at all! ---", false},
+		"missing scheme":     {"eventsub.wss.twitch.tv/ws", false},
 	}
 
 	for name, test := range tests {
@@ -73,20 +73,20 @@ func TestVoteRe(t *testing.T) {
 		wantPlayer string
 		wantValue  string
 	}{
-		"simple":                  {"!vote Alice 3", true, "Alice", "3"},
-		"uppercase command":       {"!VOTE Alice 3", true, "Alice", "3"},
-		"mixed case command":      {"!VoTe Alice 3", true, "Alice", "3"},
-		"multi-space":             {"!vote  Alice   3", true, "Alice", "3"},
-		"tab-separated":           {"!vote\tAlice\t3", true, "Alice", "3"},
-		"leading whitespace":      {" !vote Alice 3", false, "", ""},
-		"trailing content":        {"!vote Alice 3 extra", false, "", ""},
-		"no value":                {"!vote Alice", false, "", ""},
-		"non-numeric value":       {"!vote Alice three", false, "", ""},
-		"missing player":          {"!vote 3", false, "", ""},
-		"unrelated message":       {"hi chat", false, "", ""},
-		"partial prefix":          {"!vot Alice 3", false, "", ""},
-		"negative value":          {"!vote Alice -3", false, "", ""},
-		"decimal value":           {"!vote Alice 3.5", false, "", ""},
+		"simple":             {"!vote Alice 3", true, "Alice", "3"},
+		"uppercase command":  {"!VOTE Alice 3", true, "Alice", "3"},
+		"mixed case command": {"!VoTe Alice 3", true, "Alice", "3"},
+		"multi-space":        {"!vote  Alice   3", true, "Alice", "3"},
+		"tab-separated":      {"!vote\tAlice\t3", true, "Alice", "3"},
+		"leading whitespace": {" !vote Alice 3", false, "", ""},
+		"trailing content":   {"!vote Alice 3 extra", false, "", ""},
+		"no value":           {"!vote Alice", false, "", ""},
+		"non-numeric value":  {"!vote Alice three", false, "", ""},
+		"missing player":     {"!vote 3", false, "", ""},
+		"unrelated message":  {"hi chat", false, "", ""},
+		"partial prefix":     {"!vot Alice 3", false, "", ""},
+		"negative value":     {"!vote Alice -3", false, "", ""},
+		"decimal value":      {"!vote Alice 3.5", false, "", ""},
 	}
 
 	for name, test := range tests {
@@ -168,11 +168,11 @@ func TestChatMessageEvent_IsModerator(t *testing.T) {
 		badges []badge
 		want   bool
 	}{
-		"no badges":       {nil, false},
-		"moderator only":  {[]badge{{SetID: "moderator"}}, true},
-		"vip only":        {[]badge{{SetID: "vip"}}, false},
-		"subscriber only": {[]badge{{SetID: "subscriber"}}, false},
-		"mod among many":  {[]badge{{SetID: "subscriber"}, {SetID: "moderator"}}, true},
+		"no badges":                       {nil, false},
+		"moderator only":                  {[]badge{{SetID: "moderator"}}, true},
+		"vip only":                        {[]badge{{SetID: "vip"}}, false},
+		"subscriber only":                 {[]badge{{SetID: "subscriber"}}, false},
+		"mod among many":                  {[]badge{{SetID: "subscriber"}, {SetID: "moderator"}}, true},
 		"broadcaster badge alone not mod": {[]badge{{SetID: "broadcaster"}}, false},
 	}
 

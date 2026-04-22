@@ -17,12 +17,13 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
-	eventsubWSURL  = "wss://eventsub.wss.twitch.tv/ws"
-	eventsubWSHost = "eventsub.wss.twitch.tv"
-	twitchAPI      = "https://api.twitch.tv/helix"
+	eventsubWSURL   = "wss://eventsub.wss.twitch.tv/ws"
+	eventsubWSHost  = "eventsub.wss.twitch.tv"
+	defaultHelixAPI = "https://api.twitch.tv/helix"
 
 	reconnectDelay = 5 * time.Second
 
@@ -80,21 +81,35 @@ func (ev *chatMessageEvent) isModerator() bool {
 // Client
 
 type TwitchClient struct {
-	cfg          *Config
-	votes        *VoteState
-	logger       *logrus.Logger
-	httpClient   *http.Client
-	wsDialer     *websocket.Dialer
-	tokens       *tokenStore
+	cfg        *Config
+	votes      *VoteState
+	logger     *logrus.Logger
+	httpClient *http.Client
+	wsDialer   *websocket.Dialer
+	tokens     *tokenStore
+
+	// Twitch endpoint URLs are fields rather than consts so tests can point the
+	// client at an httptest.Server.
+	helixAPI         string
+	tokenValidateURL string
+	tokenRefreshURL  string
+
+	// Dedupes concurrent refreshToken() callers (proactive refreshLoop vs a
+	// reactive 401 retry inside doAuth). See auth.go:refreshToken for detail.
+	refreshGroup singleflight.Group
+
 	reconnectURL string // set on session_reconnect
 }
 
 func newTwitchClient(cfg *Config, votes *VoteState, logger *logrus.Logger) *TwitchClient {
 	return &TwitchClient{
-		cfg:    cfg,
-		votes:  votes,
-		logger: logger,
-		tokens: newTokenStore(cfg.OAuthToken, cfg.RefreshToken),
+		cfg:              cfg,
+		votes:            votes,
+		logger:           logger,
+		tokens:           newTokenStore(cfg.OAuthToken, cfg.RefreshToken),
+		helixAPI:         defaultHelixAPI,
+		tokenValidateURL: defaultTokenValidateURL,
+		tokenRefreshURL:  defaultTokenRefreshURL,
 		httpClient: &http.Client{
 			Timeout: httpClientTimeout,
 		},
@@ -396,45 +411,51 @@ func (c *TwitchClient) handleChatMessage(ctx context.Context, ev *chatMessageEve
 
 // Twitch API helpers
 
-// doAuth sends a Helix request with the current bearer token and retries once
-// on 401 after refreshing. Non-401 responses are returned verbatim to the
-// caller; transport errors are wrapped.
+// doAuth sends a Helix request with the current bearer token. On 401 it
+// refreshes the token and retries once. Non-401 responses (including non-2xx
+// like 4xx payload errors) are returned verbatim so the caller can inspect
+// status and body.
 func (c *TwitchClient) doAuth(ctx context.Context, method, endpoint string, body []byte) (*http.Response, error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		var reqBody io.Reader
-		if len(body) > 0 {
-			reqBody = bytes.NewReader(body)
-		}
-		req, err := http.NewRequestWithContext(ctx, method, endpoint, reqBody)
-		if err != nil {
-			return nil, fmt.Errorf("failed to build Helix request: %w", err)
-		}
-		req.Header.Set("Authorization", "Bearer "+c.tokens.access())
-		req.Header.Set("Client-Id", c.cfg.ClientID)
-		if len(body) > 0 {
-			req.Header.Set("Content-Type", "application/json")
-		}
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("Helix request failed: %w", err)
-		}
-
-		if resp.StatusCode != http.StatusUnauthorized || attempt == 1 {
-			return resp, nil
-		}
-
-		// First-attempt 401: the access token probably expired between the refresh
-		// loop's wakeups (e.g. Twitch revoked it, or our clock skewed). Drain the
-		// body, refresh, and retry once with the fresh token.
-		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		c.logger.Warn("Helix API returned 401, attempting token refresh.")
-		if rerr := c.refreshToken(ctx); rerr != nil {
-			return nil, fmt.Errorf("refresh after 401 failed: %w", rerr)
-		}
+	resp, err := c.sendHelix(ctx, method, endpoint, body)
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		return resp, err
 	}
-	return nil, errors.New("unreachable")
+
+	// 401: the access token probably expired between the refresh loop's
+	// wakeups (Twitch revoked it, clock skew, race). Drain the body so the
+	// http.Client can reuse the connection, refresh, retry once.
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	c.logger.Warn("Helix API returned 401, attempting token refresh.")
+	if rerr := c.refreshToken(ctx); rerr != nil {
+		return nil, fmt.Errorf("refresh after 401 failed: %w", rerr)
+	}
+	return c.sendHelix(ctx, method, endpoint, body)
+}
+
+// sendHelix is the single-shot authenticated send; doAuth layers retry on top.
+// Split out so the retry path is a straight-line call pair instead of a loop
+// with an unreachable fallthrough.
+func (c *TwitchClient) sendHelix(ctx context.Context, method, endpoint string, body []byte) (*http.Response, error) {
+	var reqBody io.Reader
+	if len(body) > 0 {
+		reqBody = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build Helix request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.tokens.access())
+	req.Header.Set("Client-Id", c.cfg.ClientID)
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Helix request failed: %w", err)
+	}
+	return resp, nil
 }
 
 func (c *TwitchClient) sendChatMessage(ctx context.Context, message string) {
@@ -450,7 +471,7 @@ func (c *TwitchClient) sendChatMessage(ctx context.Context, message string) {
 		return
 	}
 
-	resp, err := c.doAuth(ctx, http.MethodPost, twitchAPI+"/chat/messages", body)
+	resp, err := c.doAuth(ctx, http.MethodPost, c.helixAPI+"/chat/messages", body)
 	if err != nil {
 		c.logger.WithError(err).Error("Failed to send chat message.")
 		return
@@ -486,7 +507,7 @@ func (c *TwitchClient) registerEventSubListeners(ctx context.Context, sessionID 
 		return fmt.Errorf("failed to marshal EventSub subscription body: %w", err)
 	}
 
-	resp, err := c.doAuth(ctx, http.MethodPost, twitchAPI+"/eventsub/subscriptions", body)
+	resp, err := c.doAuth(ctx, http.MethodPost, c.helixAPI+"/eventsub/subscriptions", body)
 	if err != nil {
 		return fmt.Errorf("failed to register EventSub subscription: %w", err)
 	}

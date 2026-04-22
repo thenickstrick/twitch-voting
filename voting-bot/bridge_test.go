@@ -123,8 +123,8 @@ func TestHandleStart(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		"too many players": {
-			method: http.MethodPost,
-			body: `{"players":["p1","p2","p3","p4","p5","p6","p7","p8","p9","p10","p11","p12","p13","p14"]}`,
+			method:     http.MethodPost,
+			body:       `{"players":["p1","p2","p3","p4","p5","p6","p7","p8","p9","p10","p11","p12","p13","p14"]}`,
 			wantStatus: http.StatusBadRequest,
 		},
 	}
@@ -168,9 +168,9 @@ func TestHandleCast(t *testing.T) {
 			wantStatus: http.StatusOK,
 		},
 		"wrong method": {
-			setup:  setup{openWith: []string{"Alice"}},
-			method: http.MethodGet,
-			body:   `{"player":"Alice","username":"v1","value":3}`,
+			setup:      setup{openWith: []string{"Alice"}},
+			method:     http.MethodGet,
+			body:       `{"player":"Alice","username":"v1","value":3}`,
 			wantStatus: http.StatusMethodNotAllowed,
 		},
 		"invalid JSON": {

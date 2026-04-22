@@ -23,7 +23,7 @@ type VoteState struct {
 // PlayerTally holds results for a single contestant.
 type PlayerTally struct {
 	Player  string         `json:"player"`
-	Counts  map[string]int `json:"counts"`  // "1".."5" → count
+	Counts  map[string]int `json:"counts"` // "1".."5" → count
 	Total   int            `json:"total"`
 	Average *float64       `json:"average"` // nil if no votes cast
 }
@@ -50,10 +50,12 @@ func (vs *VoteState) OpenVoting(players []string) {
 	defer vs.mu.Unlock()
 	now := time.Now()
 	vs.open = true
-	vs.players = players
+	// Copy the caller's slice — if they mutate their slice later we'd be reading
+	// it under our lock and might see torn state mid-tally.
+	vs.players = append([]string(nil), players...)
 	vs.startedAt = &now
 	vs.votes = make(map[string]map[string]int)
-	for _, p := range players {
+	for _, p := range vs.players {
 		vs.votes[strings.ToLower(p)] = make(map[string]int)
 	}
 }
