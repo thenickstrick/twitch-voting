@@ -1,0 +1,25 @@
+meta {
+  name: Start Voting
+  type: http
+  seq: 1
+}
+
+post {
+  url: https://voting-bot.example.com/api/votes/start
+  body: json
+  auth: inherit
+}
+
+headers {
+  X-Bridge-Secret: 
+  Content-Type: application/json
+}
+
+body:json {
+  {"players": ["Player1", "Player2", "Player3"]}
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}

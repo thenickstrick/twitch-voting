@@ -1,0 +1,71 @@
+services:
+  # Limits Traefik's Podman API access to read-only container discovery only.
+  # With rootless Podman the socket is user-scoped, but least-privilege is still worthwhile.
+  socket-proxy:
+    image: docker.io/tecnativa/docker-socket-proxy
+    restart: unless-stopped
+    volumes:
+      - ${XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock:ro
+    environment:
+      CONTAINERS: 1  # the only permission Traefik needs
+    networks:
+      - socket-proxy
+
+  traefik:
+    image: docker.io/library/traefik:v3
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    command:
+      # Entrypoints
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.websecure.address=:443"
+      # Let's Encrypt via HTTP challenge
+      - "--certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
+      # Docker provider via socket proxy
+      - "--providers.docker=true"
+      - "--providers.docker.endpoint=tcp://socket-proxy:2375"
+      - "--providers.docker.exposedbydefault=false"
+      # File provider for TLS options and middleware (labels can't express these)
+      - "--providers.file.filename=/etc/traefik/dynamic.yml"
+      - "--providers.file.watch=true"
+      - "--log.level=INFO"
+      - "--log.format=json"
+      - "--accesslog=true"
+      - "--accesslog.format=json"
+    volumes:
+      - traefik-certs:/letsencrypt
+      - ./traefik-dynamic.yml:/etc/traefik/dynamic.yml:ro
+    networks:
+      - proxy
+      - socket-proxy
+
+  bot:
+    build: ./dti-bot
+    restart: unless-stopped
+    env_file: ./dti-bot/.env
+    networks:
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dti-bot.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.dti-bot.entrypoints=websecure"
+      - "traefik.http.routers.dti-bot.tls=true"
+      - "traefik.http.routers.dti-bot.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.dti-bot.middlewares=api-headers@file"
+      - "traefik.http.services.dti-bot.loadbalancer.server.port=3000"
+
+volumes:
+  traefik-certs:
+
+networks:
+  proxy:
+  socket-proxy:
+    internal: true  # socket-proxy has no external network access

@@ -1,0 +1,25 @@
+meta {
+  name: Cast Vote 1
+  type: http
+  seq: 5
+}
+
+post {
+  url: https://voting-bot.example.com/api/votes/cast
+  body: json
+  auth: inherit
+}
+
+headers {
+  X-Bridge-Secret: 
+  Content-Type: application/json
+}
+
+body:json {
+  {"player": "Player1", "username": "viewer1", "value": 5}
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}

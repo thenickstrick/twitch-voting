@@ -1,0 +1,20 @@
+meta {
+  name: Reset Votes
+  type: http
+  seq: 4
+}
+
+post {
+  url: https://voting-bot.example.com/api/votes/reset
+  body: none
+  auth: inherit
+}
+
+headers {
+  X-Bridge-Secret: 
+}
+
+settings {
+  encodeUrl: true
+  timeout: 0
+}
