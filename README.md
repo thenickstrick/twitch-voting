@@ -14,7 +14,7 @@ Twitch chat
 
 ## Prerequisites
 
-- [Go 1.22+](https://go.dev/dl/)
+- [Go 1.26+](https://go.dev/dl/)
 - A dedicated Twitch account for the bot (see below)
 - A [Twitch application](https://dev.twitch.tv/console) registered under any account you control
 
@@ -42,7 +42,7 @@ twitch configure # enter the Client ID and Client Secret from step 1
 twitch token -u -s 'user:bot user:read:chat user:write:chat'
 ```
 
-This opens a browser. **Make sure you're logged into the bot account**, not your main account. Authorize, and the CLI prints the access token.
+This opens a browser. **Make sure you're logged into the bot account**, not your main account. Authorize, and the CLI prints both an **access token** (`OAUTH_TOKEN`) and a **refresh token** (`REFRESH_TOKEN`). Save both — the bot uses the refresh token to renew the access token automatically (they expire every ~4h).
 
 Alternatively, use https://github.com/twitchdev/authentication-go-sample 
 with scopes set to 
@@ -88,17 +88,21 @@ Open `.env` and fill in the values:
 
 ```sh
 BOT_USER_ID=123456789          # numeric ID of the bot account (from step 4)
-OAUTH_TOKEN=xxxxxxxxxxxx       # token from step 3
+OAUTH_TOKEN=xxxxxxxxxxxx       # access token from step 3
+REFRESH_TOKEN=yyyyyyyyyyyy     # refresh token from step 3 (needed to auto-renew the access token)
 CLIENT_ID=xxxxxxxxxxxxxxxxxxxx # from step 1
+CLIENT_SECRET=xxxxxxxxxxxx     # from step 1 (needed to auto-renew the access token)
 
 BROADCASTER_USER_ID=987654321  # numeric ID of the broadcaster's channel (from step 4)
 
 BRIDGE_PORT=3000               # port the HTTP bridge listens on
-BRIDGE_SECRET=choose-a-secret  # arbitrary string for HTTP bridge auth
+BRIDGE_SECRET=choose-a-secret  # arbitrary string for HTTP bridge auth; required unless BRIDGE_AUTH_DISABLED=true
 
 MIN_VOTE=1
 MAX_VOTE=5
 ```
+
+> **Local dev without a secret:** Set `BRIDGE_AUTH_DISABLED=true` to skip the `X-Bridge-Secret` check. When disabled, the bridge binds to `127.0.0.1` only — it cannot be reached from off-host. Never set this in production.
 
 # Running the bot locally
 

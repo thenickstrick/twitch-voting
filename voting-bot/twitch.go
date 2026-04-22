@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -27,7 +30,14 @@ const (
 	wsHandshakeTimeout  = 10 * time.Second
 	wsReadLimit         = 65536 // 64 KB... well above any EventSub message
 	twitchMaxMessageLen = 500   // Twitch chat message character limit
+
+	helixErrorBodyLimit = 2 * 1024
 )
+
+// errFatalHandling marks an error as unrecoverable from run()'s perspective —
+// e.g. EventSub subscription registration failed for a non-auth reason. Wrapped
+// with %w so errors.Is lets run() distinguish "should reconnect" from "should exit".
+var errFatalHandling = errors.New("fatal EventSub handling")
 
 // Twitch EventSub message types
 
@@ -75,6 +85,7 @@ type TwitchClient struct {
 	logger       *logrus.Logger
 	httpClient   *http.Client
 	wsDialer     *websocket.Dialer
+	tokens       *tokenStore
 	reconnectURL string // set on session_reconnect
 }
 
@@ -83,6 +94,7 @@ func newTwitchClient(cfg *Config, votes *VoteState, logger *logrus.Logger) *Twit
 		cfg:    cfg,
 		votes:  votes,
 		logger: logger,
+		tokens: newTokenStore(cfg.OAuthToken, cfg.RefreshToken),
 		httpClient: &http.Client{
 			Timeout: httpClientTimeout,
 		},
@@ -92,50 +104,50 @@ func newTwitchClient(cfg *Config, votes *VoteState, logger *logrus.Logger) *Twit
 	}
 }
 
-// validateAuth calls the Twitch token validation endpoint.
-func (c *TwitchClient) validateAuth() error {
-	req, _ := http.NewRequest(http.MethodGet, "https://id.twitch.tv/oauth2/validate", nil)
-	req.Header.Set("Authorization", "OAuth "+c.cfg.OAuthToken)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to validate auth token: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		var body map[string]any
-		_ = json.NewDecoder(resp.Body).Decode(&body)
-		return fmt.Errorf("failed to validate auth token, status %d: %v", resp.StatusCode, body)
-	}
-
-	c.logger.Info("Twitch auth token validated.")
-	return nil
-}
-
-// run connects to EventSub and reconnects indefinitely on failure.
-func (c *TwitchClient) run() {
-	url := eventsubWSURL
+// run connects to EventSub and reconnects indefinitely on transient failure.
+// Exits cleanly on ctx cancellation. Returns a non-nil error only for fatal
+// conditions (e.g. non-401 subscription registration failure), which main
+// surfaces before shutting down.
+func (c *TwitchClient) run(ctx context.Context) error {
+	wsURL := eventsubWSURL
 	for {
-		err := c.connect(url)
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		err := c.connect(ctx, wsURL)
+
+		if ctx.Err() != nil {
+			return nil
+		}
+		if errors.Is(err, errFatalHandling) {
+			return err
+		}
+
 		if c.reconnectURL != "" {
 			c.logger.WithField("url", c.reconnectURL).Info("Reconnecting to new EventSub URL.")
-			url = c.reconnectURL
+			wsURL = c.reconnectURL
 			c.reconnectURL = ""
-		} else {
-			if err != nil {
-				c.logger.WithError(err).Warnf("EventSub connection lost, retrying in %s.", reconnectDelay)
-			}
-			time.Sleep(reconnectDelay)
-			url = eventsubWSURL
+			continue
 		}
+
+		if err != nil {
+			c.logger.WithError(err).Warnf("EventSub connection lost, retrying in %s.", reconnectDelay)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(reconnectDelay):
+		}
+		wsURL = eventsubWSURL
 	}
 }
 
-// connect opens one WebSocket session. Returns when the connection closes or
-// a session_reconnect is received (in which case c.reconnectURL is set).
-func (c *TwitchClient) connect(wsURL string) error {
-	conn, _, err := c.wsDialer.Dial(wsURL, nil)
+// connect opens one WebSocket session. Returns when the connection closes, a
+// session_reconnect is received (c.reconnectURL is set), ctx is cancelled, or
+// a fatal error bubbles up from message handling.
+func (c *TwitchClient) connect(ctx context.Context, wsURL string) error {
+	conn, _, err := c.wsDialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to dial EventSub WebSocket: %w", err)
 	}
@@ -144,6 +156,18 @@ func (c *TwitchClient) connect(wsURL string) error {
 	// Cap inbound message size. Twitch EventSub messages are small. this should
 	// prevent a misbehaving or spoofed server from pushing arbitrarily large payloads.
 	conn.SetReadLimit(wsReadLimit)
+
+	// Close the conn when ctx is cancelled so the blocked ReadMessage returns.
+	// The done channel prevents this helper goroutine from outliving connect().
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
 
 	c.logger.WithField("url", wsURL).Info("Connected to EventSub WebSocket.")
 
@@ -159,21 +183,27 @@ func (c *TwitchClient) connect(wsURL string) error {
 			continue
 		}
 
-		if done := c.handleMessage(&msg); done {
+		reconnect, err := c.handleMessage(ctx, &msg)
+		if err != nil {
+			return err
+		}
+		if reconnect {
 			return nil // caller will use c.reconnectURL
 		}
 	}
 }
 
-// handleMessage processes one EventSub message.
-// Returns true when the caller should stop reading and reconnect.
-func (c *TwitchClient) handleMessage(msg *wsMessage) bool {
+// handleMessage processes one EventSub message. Returns (reconnect, err). A
+// non-nil err wrapping errFatalHandling signals run() to exit.
+func (c *TwitchClient) handleMessage(ctx context.Context, msg *wsMessage) (bool, error) {
 	switch msg.Metadata.MessageType {
 	case "session_welcome":
 		sessionID := msg.Payload.Session.ID
 		c.logger.WithField("session_id", sessionID).Info("EventSub session established.")
-		if err := c.registerEventSubListeners(sessionID); err != nil {
-			c.logger.WithError(err).Fatal("Failed to register EventSub listeners for dti-chatbot.")
+		// We can't operate without an EventSub subscription — chat messages won't
+		// arrive. So any non-auth failure here is terminal; main will log and exit.
+		if err := c.registerEventSubListeners(ctx, sessionID); err != nil {
+			return false, fmt.Errorf("%w: register EventSub listeners: %w", errFatalHandling, err)
 		}
 
 	case "session_keepalive":
@@ -181,7 +211,7 @@ func (c *TwitchClient) handleMessage(msg *wsMessage) bool {
 
 	case "notification":
 		if msg.Metadata.SubscriptionType == "channel.chat.message" {
-			c.handleChatMessage(&msg.Payload.Event)
+			c.handleChatMessage(ctx, &msg.Payload.Event)
 		}
 
 	case "session_reconnect":
@@ -190,13 +220,13 @@ func (c *TwitchClient) handleMessage(msg *wsMessage) bool {
 			// Reconnect URLs must come from Twitch's own EventSub host. Anything
 			// else could be an attempt to redirect the bot to an attacker-controlled server.
 			c.logger.WithField("url", raw).Warn("Ignoring session_reconnect with unrecognised URL, will reconnect to default.")
-			return false
+			return false, nil
 		}
 		c.reconnectURL = raw
-		return true
+		return true, nil
 	}
 
-	return false
+	return false, nil
 }
 
 // isValidReconnectURL ensures a Twitch-issued reconnect URL stays on the expected host.
@@ -212,11 +242,11 @@ func isValidReconnectURL(raw string) bool {
 
 const (
 	maxPlayers    = 13
-	maxPlayerName = 25 
+	maxPlayerName = 25
 )
 
 var (
-	voteRe      = regexp.MustCompile(`(?i)^!vote\s+(\S+)\s+(\d+)$`)
+	voteRe       = regexp.MustCompile(`(?i)^!vote\s+(\S+)\s+(\d+)$`)
 	playerNameRe = regexp.MustCompile(`^[\w]+$`)
 )
 
@@ -225,21 +255,21 @@ func validatePlayerNames(players []string) error {
 	seen := make(map[string]bool, len(players))
 	for _, p := range players {
 		if len(p) > maxPlayerName {
-			return fmt.Errorf("Player name %q is too long (max %d chars).", p, maxPlayerName)
+			return fmt.Errorf("player name %q is too long (max %d chars)", p, maxPlayerName)
 		}
 		if !playerNameRe.MatchString(p) {
-			return fmt.Errorf("Player name %q contains invalid characters.", p)
+			return fmt.Errorf("player name %q contains invalid characters", p)
 		}
 		key := strings.ToLower(p)
 		if seen[key] {
-			return fmt.Errorf("Duplicate player name: %s", p)
+			return fmt.Errorf("duplicate player name: %s", p)
 		}
 		seen[key] = true
 	}
 	return nil
 }
 
-func (c *TwitchClient) handleChatMessage(ev *chatMessageEvent) {
+func (c *TwitchClient) handleChatMessage(ctx context.Context, ev *chatMessageEvent) {
 	text := strings.TrimSpace(ev.Message.Text)
 	username := ev.ChatterUserLogin
 	isBroadcaster := ev.ChatterUserID == ev.BroadcasterUserID
@@ -256,15 +286,15 @@ func (c *TwitchClient) handleChatMessage(ev *chatMessageEvent) {
 		if strings.HasPrefix(text, "!startvote") {
 			players := strings.Fields(strings.TrimPrefix(text, "!startvote"))
 			if len(players) == 0 {
-				c.sendChatMessage("Usage: !startvote player1 player2 ...")
+				c.sendChatMessage(ctx, "Usage: !startvote player1 player2 ...")
 				return
 			}
 			if len(players) > maxPlayers {
-				c.sendChatMessage(fmt.Sprintf("Too many players (max %d).", maxPlayers))
+				c.sendChatMessage(ctx, fmt.Sprintf("Too many players (max %d).", maxPlayers))
 				return
 			}
 			if err := validatePlayerNames(players); err != nil {
-				c.sendChatMessage(err.Error())
+				c.sendChatMessage(ctx, err.Error())
 				return
 			}
 			c.votes.OpenVoting(players)
@@ -273,7 +303,7 @@ func (c *TwitchClient) handleChatMessage(ev *chatMessageEvent) {
 				"range":   fmt.Sprintf("%d-%d", c.cfg.MinVote, c.cfg.MaxVote),
 			}).Info("Voting opened.")
 
-			c.sendChatMessage(fmt.Sprintf(
+			c.sendChatMessage(ctx, fmt.Sprintf(
 				"Voting is now OPEN! Players: %s. Type !vote <player> <%d-%d>",
 				strings.Join(players, ", "), c.cfg.MinVote, c.cfg.MaxVote,
 			))
@@ -282,19 +312,19 @@ func (c *TwitchClient) handleChatMessage(ev *chatMessageEvent) {
 
 		if text == "!endvote" {
 			if !c.votes.IsOpen() && !c.votes.HasVotes() {
-				c.sendChatMessage("No vote is currently open.")
+				c.sendChatMessage(ctx, "No vote is currently open.")
 				return
 			}
 			tally := c.votes.CloseVoting()
 			c.logger.WithField("results", tally.Results).Info("Voting closed.")
-			c.sendChatMessage("Voting closed! " + strings.Join(formatResultLines(tally, c.cfg.MaxVote), " | "))
+			c.sendChatMessage(ctx, "Voting closed! "+strings.Join(formatResultLines(tally, c.cfg.MaxVote), " | "))
 			return
 		}
 
 		if text == "!resetvote" {
 			c.votes.ResetVotes()
 			c.logger.Info("Votes reset.")
-			c.sendChatMessage("Votes have been reset.")
+			c.sendChatMessage(ctx, "Votes have been reset.")
 			return
 		}
 	}
@@ -302,7 +332,7 @@ func (c *TwitchClient) handleChatMessage(ev *chatMessageEvent) {
 	// Anyone: show current tally
 	if text == "!votes" || text == "!votecount" {
 		if !c.votes.IsOpen() && !c.votes.HasVotes() {
-			c.sendChatMessage("No vote is currently open.")
+			c.sendChatMessage(ctx, "No vote is currently open.")
 			return
 		}
 		tally := c.votes.GetTally()
@@ -318,11 +348,11 @@ func (c *TwitchClient) handleChatMessage(ev *chatMessageEvent) {
 			}
 			lines = append(lines, fmt.Sprintf("%s: %s/%d (%d votes)", r.Player, avg, c.cfg.MaxVote, r.Total))
 		}
-		c.sendChatMessage(fmt.Sprintf("[%s] %s", status, strings.Join(lines, " | ")))
+		c.sendChatMessage(ctx, fmt.Sprintf("[%s] %s", status, strings.Join(lines, " | ")))
 		return
 	}
 
-	// Vote command 
+	// Vote command
 	if c.votes.IsOpen() {
 		if m := voteRe.FindStringSubmatch(text); m != nil {
 			playerInput := m[1]
@@ -331,7 +361,7 @@ func (c *TwitchClient) handleChatMessage(ev *chatMessageEvent) {
 			display, found := c.votes.FindPlayer(playerInput)
 			if !found {
 				playerList := strings.Join(c.votes.GetTally().Players, ", ")
-				c.sendChatMessage(fmt.Sprintf(
+				c.sendChatMessage(ctx, fmt.Sprintf(
 					"@%s Player %q not found. Players: %s",
 					username, playerInput, playerList,
 				))
@@ -340,7 +370,7 @@ func (c *TwitchClient) handleChatMessage(ev *chatMessageEvent) {
 
 			prev, accepted := c.votes.CastVote(display, username, val)
 			if !accepted {
-				c.sendChatMessage(fmt.Sprintf(
+				c.sendChatMessage(ctx, fmt.Sprintf(
 					"@%s Vote must be between %d and %d.",
 					username, c.cfg.MinVote, c.cfg.MaxVote,
 				))
@@ -366,21 +396,61 @@ func (c *TwitchClient) handleChatMessage(ev *chatMessageEvent) {
 
 // Twitch API helpers
 
-func (c *TwitchClient) sendChatMessage(message string) {
+// doAuth sends a Helix request with the current bearer token and retries once
+// on 401 after refreshing. Non-401 responses are returned verbatim to the
+// caller; transport errors are wrapped.
+func (c *TwitchClient) doAuth(ctx context.Context, method, endpoint string, body []byte) (*http.Response, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		var reqBody io.Reader
+		if len(body) > 0 {
+			reqBody = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, endpoint, reqBody)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build Helix request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+c.tokens.access())
+		req.Header.Set("Client-Id", c.cfg.ClientID)
+		if len(body) > 0 {
+			req.Header.Set("Content-Type", "application/json")
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("Helix request failed: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusUnauthorized || attempt == 1 {
+			return resp, nil
+		}
+
+		// First-attempt 401: the access token probably expired between the refresh
+		// loop's wakeups (e.g. Twitch revoked it, or our clock skewed). Drain the
+		// body, refresh, and retry once with the fresh token.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		c.logger.Warn("Helix API returned 401, attempting token refresh.")
+		if rerr := c.refreshToken(ctx); rerr != nil {
+			return nil, fmt.Errorf("refresh after 401 failed: %w", rerr)
+		}
+	}
+	return nil, errors.New("unreachable")
+}
+
+func (c *TwitchClient) sendChatMessage(ctx context.Context, message string) {
 	message = truncateMessage(message)
 
-	body, _ := json.Marshal(map[string]string{
+	body, err := json.Marshal(map[string]string{
 		"broadcaster_id": c.cfg.BroadcasterUserID,
 		"sender_id":      c.cfg.BotUserID,
 		"message":        message,
 	})
+	if err != nil {
+		c.logger.WithError(err).Error("Failed to marshal chat message body.")
+		return
+	}
 
-	req, _ := http.NewRequest(http.MethodPost, twitchAPI+"/chat/messages", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+c.cfg.OAuthToken)
-	req.Header.Set("Client-Id", c.cfg.ClientID)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doAuth(ctx, http.MethodPost, twitchAPI+"/chat/messages", body)
 	if err != nil {
 		c.logger.WithError(err).Error("Failed to send chat message.")
 		return
@@ -388,11 +458,10 @@ func (c *TwitchClient) sendChatMessage(message string) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		var errBody map[string]any
-		_ = json.NewDecoder(resp.Body).Decode(&errBody)
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, helixErrorBodyLimit))
 		c.logger.WithFields(logrus.Fields{
 			"status":   resp.StatusCode,
-			"response": errBody,
+			"response": string(errBody),
 		}).Error("Chat message rejected by Twitch API.")
 		return
 	}
@@ -400,8 +469,8 @@ func (c *TwitchClient) sendChatMessage(message string) {
 	c.logger.WithField("message", message).Debug("Chat message sent.")
 }
 
-func (c *TwitchClient) registerEventSubListeners(sessionID string) error {
-	body, _ := json.Marshal(map[string]any{
+func (c *TwitchClient) registerEventSubListeners(ctx context.Context, sessionID string) error {
+	body, err := json.Marshal(map[string]any{
 		"type":    "channel.chat.message",
 		"version": "1",
 		"condition": map[string]string{
@@ -413,28 +482,28 @@ func (c *TwitchClient) registerEventSubListeners(sessionID string) error {
 			"session_id": sessionID,
 		},
 	})
+	if err != nil {
+		return fmt.Errorf("failed to marshal EventSub subscription body: %w", err)
+	}
 
-	req, _ := http.NewRequest(http.MethodPost, twitchAPI+"/eventsub/subscriptions", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+c.cfg.OAuthToken)
-	req.Header.Set("Client-Id", c.cfg.ClientID)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.doAuth(ctx, http.MethodPost, twitchAPI+"/eventsub/subscriptions", body)
 	if err != nil {
 		return fmt.Errorf("failed to register EventSub subscription: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusAccepted {
-		var errBody map[string]any
-		_ = json.NewDecoder(resp.Body).Decode(&errBody)
-		return fmt.Errorf("failed to register EventSub subscription, status %d: %v", resp.StatusCode, errBody)
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, helixErrorBodyLimit))
+		return fmt.Errorf("failed to register EventSub subscription, status %d: %s", resp.StatusCode, errBody)
 	}
 
 	var result struct {
 		Data []struct{ ID string } `json:"data"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		c.logger.WithError(err).Warn("Failed to decode EventSub subscription response, continuing.")
+		return nil
+	}
 	if len(result.Data) > 0 {
 		c.logger.WithField("subscription_id", result.Data[0].ID).Info("Subscribed to channel chat messages.")
 	}

@@ -1,8 +1,8 @@
 package main
 
 import (
-	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,10 +36,10 @@ type Tally struct {
 	Results   []PlayerTally `json:"results"`   // sorted by average descending
 }
 
-func newVoteState(min, max int) *VoteState {
+func newVoteState(minVote, maxVote int) *VoteState {
 	return &VoteState{
-		minVote: min,
-		maxVote: max,
+		minVote: minVote,
+		maxVote: maxVote,
 		votes:   make(map[string]map[string]int),
 	}
 }
@@ -156,12 +156,12 @@ func (vs *VoteState) computeTally() Tally {
 
 		counts := make(map[string]int, vs.maxVote-vs.minVote+1)
 		for v := vs.minVote; v <= vs.maxVote; v++ {
-			counts[fmt.Sprintf("%d", v)] = 0
+			counts[strconv.Itoa(v)] = 0
 		}
 
 		var sum int
 		for _, val := range playerVotes {
-			counts[fmt.Sprintf("%d", val)]++
+			counts[strconv.Itoa(val)]++
 			sum += val
 		}
 
@@ -180,7 +180,9 @@ func (vs *VoteState) computeTally() Tally {
 		})
 	}
 
-	// Sort by average descending; players with no votes go last.
+	// Sort by average descending. Players with no votes yet have a nil average and
+	// sort to the end — otherwise an unscored player would appear to "win" at 0.0
+	// before the first vote came in.
 	sort.Slice(results, func(i, j int) bool {
 		ai, aj := results[i].Average, results[j].Average
 		if ai == nil && aj == nil {

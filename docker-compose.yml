@@ -48,19 +48,19 @@ services:
       - socket-proxy
 
   bot:
-    build: ./dti-bot
+    build: ./voting-bot
     restart: unless-stopped
-    env_file: ./dti-bot/.env
+    env_file: ./voting-bot/.env
     networks:
       - proxy
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.dti-bot.rule=Host(`${DOMAIN}`)"
-      - "traefik.http.routers.dti-bot.entrypoints=websecure"
-      - "traefik.http.routers.dti-bot.tls=true"
-      - "traefik.http.routers.dti-bot.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.dti-bot.middlewares=api-headers@file"
-      - "traefik.http.services.dti-bot.loadbalancer.server.port=3000"
+      - "traefik.http.routers.voting-bot.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.voting-bot.entrypoints=websecure"
+      - "traefik.http.routers.voting-bot.tls=true"
+      - "traefik.http.routers.voting-bot.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.voting-bot.middlewares=api-headers@file"
+      - "traefik.http.services.voting-bot.loadbalancer.server.port=3000"
 
 volumes:
   traefik-certs:

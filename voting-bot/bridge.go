@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -15,28 +19,54 @@ const (
 	serverWriteTimeout      = 10 * time.Second
 	serverIdleTimeout       = 60 * time.Second
 	maxRequestBodyBytes     = 1024
+
+	// Only the unauthenticated GET /api/votes path is rate-limited — authenticated
+	// routes are already gated by the bridge secret. Global limiter: good enough
+	// for the expected single-consumer polling pattern. Can be upgraded to per-IP
+	// if the deployment ever hosts multiple external consumers.
+	votesReadRatePerSecond = 30
+	votesReadBurst         = 60
+
+	bridgeShutdownTimeout = 5 * time.Second
 )
 
 type bridge struct {
-	cfg    *Config
-	votes  *VoteState
-	logger *logrus.Logger
+	cfg         *Config
+	votes       *VoteState
+	logger      *logrus.Logger
+	votesLimiter *rate.Limiter
 }
 
 func newBridge(cfg *Config, votes *VoteState, logger *logrus.Logger) *bridge {
-	return &bridge{cfg: cfg, votes: votes, logger: logger}
+	return &bridge{
+		cfg:          cfg,
+		votes:        votes,
+		logger:       logger,
+		votesLimiter: rate.NewLimiter(rate.Limit(votesReadRatePerSecond), votesReadBurst),
+	}
 }
 
-func (b *bridge) start() {
+// start runs the HTTP bridge until ctx is cancelled, then triggers a graceful
+// shutdown. Returns a non-nil error if the server fails to start or shut down
+// cleanly; main will log and exit.
+func (b *bridge) start(ctx context.Context) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/votes", b.handleVotes)
+	mux.HandleFunc("/api/votes", b.rateLimited(b.handleVotes))
 	mux.HandleFunc("/api/votes/detail", b.requireSecret(b.handleDetail))
 	mux.HandleFunc("/api/votes/start", b.requireSecret(b.handleStart))
 	mux.HandleFunc("/api/votes/cast", b.requireSecret(b.handleCast))
 	mux.HandleFunc("/api/votes/end", b.requireSecret(b.handleEnd))
 	mux.HandleFunc("/api/votes/reset", b.requireSecret(b.handleReset))
 
+	// When bridge auth is disabled we bind to loopback only. Otherwise unauthenticated
+	// privileged routes would be exposed to anything that can reach the bot's port
+	// (including Traefik, which publishes it on the configured domain).
 	addr := ":" + b.cfg.BridgePort
+	if b.cfg.BridgeAuthDisabled {
+		addr = "127.0.0.1:" + b.cfg.BridgePort
+		b.logger.Warn("Bridge auth disabled via BRIDGE_AUTH_DISABLED, binding to localhost only.")
+	}
+
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -46,14 +76,37 @@ func (b *bridge) start() {
 		IdleTimeout:       serverIdleTimeout,
 	}
 
-	b.logger.WithField("addr", addr).Info("HTTP bridge listening.")
+	serveErr := make(chan error, 1)
+	go func() {
+		b.logger.WithField("addr", addr).Info("HTTP bridge listening.")
+		// ListenAndServe only returns a non-http.ErrServerClosed error when the
+		// listener itself fails (port in use, bind error) — that is a real failure
+		// we want main to learn about.
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
 
-	if err := server.ListenAndServe(); err != nil {
-		b.logger.WithError(err).Fatal("HTTP bridge server stopped unexpectedly.")
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), bridgeShutdownTimeout)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("bridge graceful shutdown failed: %w", err)
+		}
+		b.logger.Info("HTTP bridge stopped.")
+		return <-serveErr
+	case err := <-serveErr:
+		if err != nil {
+			return fmt.Errorf("bridge server failed: %w", err)
+		}
+		return nil
 	}
 }
 
-// GET /api/votes 
+// GET /api/votes
 func (b *bridge) handleVotes(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
@@ -169,12 +222,37 @@ func (b *bridge) handleReset(w http.ResponseWriter, r *http.Request) {
 }
 
 // requireSecret wraps a handler to enforce the X-Bridge-Secret header.
-// If BRIDGE_SECRET is empty the check is skipped (dev mode).
+// Only skipped when BRIDGE_AUTH_DISABLED=true, in which case start() is already
+// bound to loopback so external callers can't reach here.
 func (b *bridge) requireSecret(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if b.cfg.BridgeSecret != "" && r.Header.Get("X-Bridge-Secret") != b.cfg.BridgeSecret {
+		if b.cfg.BridgeAuthDisabled {
+			next(w, r)
+			return
+		}
+		// Constant-time compare defends against timing side channels that could leak
+		// the secret byte-by-byte. Length check first because ConstantTimeCompare only
+		// runs in constant time when inputs are the same length.
+		provided := r.Header.Get("X-Bridge-Secret")
+		expected := b.cfg.BridgeSecret
+		if len(provided) != len(expected) ||
+			subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
 			b.logger.WithField("remote_addr", r.RemoteAddr).Warn("Bridge request rejected: invalid secret.")
 			writeJSON(w, http.StatusForbidden, errorBody("forbidden"))
+			return
+		}
+		next(w, r)
+	}
+}
+
+// rateLimited returns a handler that rejects requests exceeding the global
+// token-bucket rate. Applied to unauthenticated GET /api/votes so a single
+// client can't hammer the endpoint.
+func (b *bridge) rateLimited(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !b.votesLimiter.Allow() {
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, http.StatusTooManyRequests, errorBody("rate limit exceeded"))
 			return
 		}
 		next(w, r)
