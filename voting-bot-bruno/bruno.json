@@ -6,10 +6,10 @@
     "node_modules",
     ".git"
   ],
-  "size": 0,
-  "filesCount": 0,
+  "size": 0.0015125274658203125,
+  "filesCount": 7,
   "presets": {
     "requestType": "http",
-    "requestUrl": "https://voting-bot.example.com/api/votes"
+    "requestUrl": "https://dti-chatbot.thenickstrick.com/api/votes"
   }
 }

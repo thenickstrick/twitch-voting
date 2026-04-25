@@ -330,7 +330,7 @@ After=network.target podman.socket
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=%h/voting-bot
+WorkingDirectory=%h/twitch-voting
 ExecStart=podman-compose up -d
 ExecStop=podman-compose down
 
@@ -349,7 +349,7 @@ sudo -u bot-user bash -c "XDG_RUNTIME_DIR=$RUN_DIR DBUS_SESSION_BUS_ADDRESS=unix
 The first start pulls images and builds the bot, so it may take a few minutes. Traefik will issue the Let's Encrypt certificate on the first HTTPS request (usually under 30 seconds after startup). Check logs:
 
 ```sh
-sudo -u bot-user bash -c "XDG_RUNTIME_DIR=$RUN_DIR DBUS_SESSION_BUS_ADDRESS=unix:path=$RUN_DIR/bus journalctl --user -u bot-user -f"
+sudo -u bot-user bash -c "XDG_RUNTIME_DIR=$RUN_DIR DBUS_SESSION_BUS_ADDRESS=unix:path=$RUN_DIR/bus journalctl --user -u voting-bot -f"
 ```
 
 ### Security notes
@@ -386,12 +386,12 @@ RUN_DIR=/run/user/$(id -u bot-user)
 **Updating the bot**
 
 ```sh
-cd /home/bot-user/voting-bot
+cd /home/bot-user/twitch-voting
 sudo git pull
 sudo chown -R bot-user:bot-user .
 
-sudo -u bot-user bash -c "cd /home/bot-user/twitch-voting/voting-bot && XDG_RUNTIME_DIR=$RUN_DIR podman-compose build bot"
-sudo -u bot-user bash -c "cd /home/bot-user/twitch-voting/voting-bot && XDG_RUNTIME_DIR=$RUN_DIR podman-compose up -d --force-recreate bot"
+sudo -u bot-user bash -c "cd /home/bot-user/twitch-voting && XDG_RUNTIME_DIR=$RUN_DIR podman-compose build bot"
+sudo -u bot-user bash -c "cd /home/bot-user/twitch-voting && XDG_RUNTIME_DIR=$RUN_DIR podman-compose up -d --force-recreate bot"
 ```
 
 **Rotating secrets or changing env vars**
@@ -399,24 +399,24 @@ sudo -u bot-user bash -c "cd /home/bot-user/twitch-voting/voting-bot && XDG_RUNT
 Edit the `.env` file, then recreate the container to pick up the new values (no rebuild needed):
 
 ```sh
-sudo -u bot-user bash -c "cd /home/bot-user/twitch-voting/voting-bot && XDG_RUNTIME_DIR=$RUN_DIR podman-compose up -d --force-recreate voting-bot"
+sudo -u bot-user bash -c "cd /home/bot-user/twitch-voting && XDG_RUNTIME_DIR=$RUN_DIR podman-compose up -d --force-recreate bot"
 ```
 
 **Restarting all services**
 
 ```sh
-sudo -u bot-user bash -c "cd /home/bot-user/twitch-voting/voting-bot && XDG_RUNTIME_DIR=$RUN_DIR podman-compose down"
-sudo -u bot-user bash -c "cd /home/bot-user/twitch-voting/voting-bot && XDG_RUNTIME_DIR=$RUN_DIR podman-compose up -d"
+sudo -u bot-user bash -c "cd /home/bot-user/twitch-voting && XDG_RUNTIME_DIR=$RUN_DIR podman-compose down"
+sudo -u bot-user bash -c "cd /home/bot-user/twitch-voting && XDG_RUNTIME_DIR=$RUN_DIR podman-compose up -d"
 ```
 
 **Viewing logs**
 
 ```sh
 # Bot logs
-sudo -u bot-user bash -c "cd /home/bot-user && XDG_RUNTIME_DIR=$RUN_DIR podman logs -f voting-bot_bot_1"
+sudo -u bot-user bash -c "cd /home/bot-user && XDG_RUNTIME_DIR=$RUN_DIR podman logs -f twitch-voting_bot_1"
 
 # Traefik logs
-sudo -u bot-user bash -c "cd /home/bot-user && XDG_RUNTIME_DIR=$RUN_DIR podman logs -f voting-bot_traefik_1"
+sudo -u bot-user bash -c "cd /home/bot-user && XDG_RUNTIME_DIR=$RUN_DIR podman logs -f twitch-voting_traefik_1"
 
 # Systemd service logs
 sudo -u bot-user bash -c "XDG_RUNTIME_DIR=$RUN_DIR DBUS_SESSION_BUS_ADDRESS=unix:path=$RUN_DIR/bus journalctl --user -u voting-bot -f"
@@ -427,6 +427,48 @@ sudo -u bot-user bash -c "XDG_RUNTIME_DIR=$RUN_DIR DBUS_SESSION_BUS_ADDRESS=unix
 ```sh
 sudo -u bot-user bash -c "cd /home/bot-user && XDG_RUNTIME_DIR=$RUN_DIR podman ps -a"
 ```
+
+### Troubleshooting
+
+**`systemctl status voting-bot` shows `active (exited)` but the bot doesn't work**
+
+The systemd unit only tracks the `podman-compose up -d` exit code, which succeeds as soon as containers are *created* — not when they're healthy. A crashlooping container will still show the unit as active. Always confirm with `podman ps` + per-container logs:
+
+```sh
+sudo -u bot-user bash -c "cd /home/bot-user && XDG_RUNTIME_DIR=$RUN_DIR podman ps --format '{{.Names}}\t{{.Status}}'"
+sudo -u bot-user bash -c "cd /home/bot-user && XDG_RUNTIME_DIR=$RUN_DIR podman logs --tail 50 twitch-voting_bot_1"
+```
+
+**Bot logs show `missing required env vars: ...`**
+
+`voting-bot/.env` is missing values. Fill them in (see step 6 of local setup for what each var does), then recreate the bot container — no rebuild needed since the image doesn't change:
+
+```sh
+sudo -u bot-user vi /home/bot-user/twitch-voting/voting-bot/.env
+sudo -u bot-user bash -c "cd /home/bot-user/twitch-voting && XDG_RUNTIME_DIR=$RUN_DIR podman-compose up -d --force-recreate bot"
+```
+
+To check which expected vars have values without printing the secrets themselves:
+
+```sh
+sudo -u bot-user grep -E '^(REFRESH_TOKEN|CLIENT_SECRET|CLIENT_ID|OAUTH_TOKEN|BOT_USER_ID|BROADCASTER_USER_ID|BRIDGE_SECRET)=' \
+  /home/bot-user/twitch-voting/voting-bot/.env | sed 's/=.*/=<set>/'
+```
+
+**`curl https://<domain>/api/votes` returns `404 page not found`**
+
+That 404 comes from Traefik, not the bot — it means no router matched the request. Two common causes:
+
+- The bot container is down or crashlooping, so its router has no healthy backend. Check `podman ps` and bot logs.
+- You hit a path other than `/api/*` — the bot only serves the bridge API, so `https://<domain>/` legitimately 404s.
+
+**`cannot chdir to /root` when running a `sudo -u bot-user bash -c` command**
+
+`sudo -u` keeps the original `cwd`, and `bot-user` can't read `/root`. Harmless but noisy. Prefix the inner command with `cd /home/bot-user &&` (or any directory bot-user can read).
+
+**Container names don't match what's in this README**
+
+`podman-compose` derives the project name from the directory containing `docker-compose.yml`. If you cloned the repo to a different parent directory, container names will be `<your-dir>_<service>_1` instead of `twitch-voting_<service>_1`. List them with `podman ps --format '{{.Names}}'`.
 
 ---
 

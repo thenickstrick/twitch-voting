@@ -1,11 +1,11 @@
 meta {
-  name: Start Voting
+  name: Cast Vote Player1 viewer2
   type: http
-  seq: 1
+  seq: 9
 }
 
 post {
-  url: https://dti-chatbot.thenickstrick.com/api/votes/start
+  url: https://dti-chatbot.thenickstrick.com/api/votes/cast
   body: json
   auth: inherit
 }
@@ -16,7 +16,7 @@ headers {
 }
 
 body:json {
-  {"players": ["Player1", "Player2", "Player3"]}
+  {"player": "Player1", "username": "viewer2", "value": 4}
 }
 
 settings {

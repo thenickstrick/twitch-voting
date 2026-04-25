@@ -1,15 +1,16 @@
 meta {
   name: Check Votes
   type: http
-  seq: 2
+  seq: 3
 }
 
 get {
-  url: https://voting-bot.example.com/api/votes
+  url: https://dti-chatbot.thenickstrick.com/api/votes
   body: none
   auth: inherit
 }
 
 settings {
   encodeUrl: true
+  timeout: 0
 }
